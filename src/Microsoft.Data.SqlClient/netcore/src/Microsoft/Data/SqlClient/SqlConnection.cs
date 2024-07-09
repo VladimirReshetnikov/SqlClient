@@ -76,6 +76,9 @@ namespace Microsoft.Data.SqlClient
         // status of invariant culture environment check
         private static CultureCheckState _cultureCheckState;
 
+        // Field to hold the reference to SqlConnectionX
+        private Microsoft.Data.SqlClientX.SqlConnectionX _sqlConnectionX;
+
         // System column encryption key store providers are added by default
         private static readonly Dictionary<string, SqlColumnEncryptionKeyStoreProvider> s_systemColumnEncryptionKeyStoreProviders
             = new(capacity: 3, comparer: StringComparer.OrdinalIgnoreCase)
@@ -158,6 +161,7 @@ namespace Microsoft.Data.SqlClient
         public SqlConnection(string connectionString) : this()
         {
             ConnectionString = connectionString;    // setting connection string first so that ConnectionOption is available
+            _sqlConnectionX = new Microsoft.Data.SqlClientX.SqlConnectionX(connectionString);
         }
 
         /// <include file='../../../../../../../doc/snippets/Microsoft.Data.SqlClient/SqlConnection.xml' path='docs/members[@name="SqlConnection"]/ctorConnectionStringCredential/*' />
@@ -210,9 +214,7 @@ namespace Microsoft.Data.SqlClient
 
                 Credential = credential;
             }
-            // else
-            //      credential == null:  we should not set "Credential" as this will do additional validation check and
-            //      checking pool groups which is not necessary. All necessary operation is already done by calling "ConnectionString = connectionString"
+            _sqlConnectionX = new Microsoft.Data.SqlClientX.SqlConnectionX(connectionString, credential);
         }
 
         private SqlConnection(SqlConnection connection)
@@ -230,6 +232,7 @@ namespace Microsoft.Data.SqlClient
             _accessToken = connection._accessToken;
             _accessTokenCallback = connection._accessTokenCallback;
             CacheConnectionStringProperties();
+            _sqlConnectionX = new Microsoft.Data.SqlClientX.SqlConnectionX(connection._sqlConnectionX);
         }
 
         internal static bool TryGetSystemColumnEncryptionKeyStoreProvider(string keyStoreName, out SqlColumnEncryptionKeyStoreProvider provider)
@@ -1153,25 +1156,19 @@ namespace Microsoft.Data.SqlClient
         /// <include file='../../../../../../../doc/snippets/Microsoft.Data.SqlClient/SqlConnection.xml' path='docs/members[@name="SqlConnection"]/BeginTransaction2/*' />
         new public SqlTransaction BeginTransaction()
         {
-            // this is just a delegate. The actual method tracks executiontime
-            return BeginTransaction(System.Data.IsolationLevel.Unspecified, null);
+            return _sqlConnectionX.BeginTransaction();
         }
 
         /// <include file='../../../../../../../doc/snippets/Microsoft.Data.SqlClient/SqlConnection.xml' path='docs/members[@name="SqlConnection"]/BeginTransactionIso/*' />
         new public SqlTransaction BeginTransaction(System.Data.IsolationLevel iso)
         {
-            // this is just a delegate. The actual method tracks executiontime
-            return BeginTransaction(iso, null);
+            return _sqlConnectionX.BeginTransaction(iso);
         }
 
         /// <include file='../../../../../../../doc/snippets/Microsoft.Data.SqlClient/SqlConnection.xml' path='docs/members[@name="SqlConnection"]/BeginTransactionTransactionName/*' />
         public SqlTransaction BeginTransaction(string transactionName)
         {
-            // Use transaction names only on the outermost pair of nested
-            // BEGIN...COMMIT or BEGIN...ROLLBACK statements.  Transaction names
-            // are ignored for nested BEGIN's.  The only way to rollback a nested
-            // transaction is to have a save point from a SAVE TRANSACTION call.
-            return BeginTransaction(System.Data.IsolationLevel.Unspecified, transactionName);
+            return _sqlConnectionX.BeginTransaction(transactionName);
         }
 
         /// <include file='../../../../../../../doc/snippets/Microsoft.Data.SqlClient/SqlConnection.xml' path='docs/members[@name="SqlConnection"]/BeginDbTransaction/*' />
@@ -1195,53 +1192,13 @@ namespace Microsoft.Data.SqlClient
         /// <include file='../../../../../../../doc/snippets/Microsoft.Data.SqlClient/SqlConnection.xml' path='docs/members[@name="SqlConnection"]/BeginTransactionIsoTransactionName/*' />
         public SqlTransaction BeginTransaction(System.Data.IsolationLevel iso, string transactionName)
         {
-            WaitForPendingReconnection();
-            SqlStatistics statistics = null;
-            using (TryEventScope.Create(SqlClientEventSource.Log.TryScopeEnterEvent("SqlConnection.BeginTransaction | API | Object Id {0}, Iso {1}, Transaction Name '{2}'", ObjectID, (int)iso, transactionName)))
-            {
-                try
-                {
-                    statistics = SqlStatistics.StartTimer(Statistics);
-
-                    SqlTransaction transaction;
-                    bool isFirstAttempt = true;
-                    do
-                    {
-                        transaction = GetOpenTdsConnection().BeginSqlTransaction(iso, transactionName, isFirstAttempt); // do not reconnect twice
-                        Debug.Assert(isFirstAttempt || !transaction.InternalTransaction.ConnectionHasBeenRestored, "Restored connection on non-first attempt");
-                        isFirstAttempt = false;
-                    } while (transaction.InternalTransaction.ConnectionHasBeenRestored);
-
-
-                    //  The GetOpenConnection line above doesn't keep a ref on the outer connection (this),
-                    //  and it could be collected before the inner connection can hook it to the transaction, resulting in
-                    //  a transaction with a null connection property.  Use GC.KeepAlive to ensure this doesn't happen.
-                    GC.KeepAlive(this);
-
-                    return transaction;
-                }
-                finally
-                {
-                    SqlStatistics.StopTimer(statistics);
-                }
-            }
+            return _sqlConnectionX.BeginTransaction(iso, transactionName);
         }
 
         /// <include file='../../../../../../../doc/snippets/Microsoft.Data.SqlClient/SqlConnection.xml' path='docs/members[@name="SqlConnection"]/ChangeDatabase/*' />
         public override void ChangeDatabase(string database)
         {
-            SqlStatistics statistics = null;
-            RepairInnerConnection();
-            SqlClientEventSource.Log.TryCorrelationTraceEvent("SqlConnection.ChangeDatabase | API | Correlation | Object Id {0}, Activity Id {1}, Database {2}", ObjectID, ActivityCorrelator.Current, database);
-            try
-            {
-                statistics = SqlStatistics.StartTimer(Statistics);
-                InnerConnection.ChangeDatabase(database);
-            }
-            finally
-            {
-                SqlStatistics.StopTimer(statistics);
-            }
+            _sqlConnectionX.ChangeDatabase(database);
         }
 
         /// <include file='../../../../../../../doc/snippets/Microsoft.Data.SqlClient/SqlConnection.xml' path='docs/members[@name="SqlConnection"]/ClearAllPools/*' />
@@ -1277,89 +1234,13 @@ namespace Microsoft.Data.SqlClient
         /// <include file='../../../../../../../doc/snippets/Microsoft.Data.SqlClient/SqlConnection.xml' path='docs/members[@name="SqlConnection"]/Close/*' />
         public override void Close()
         {
-            using (TryEventScope.Create("SqlConnection.Close | API | Object Id {0}", ObjectID))
-            {
-                SqlClientEventSource.Log.TryCorrelationTraceEvent("SqlConnection.Close | API | Correlation | Object Id {0}, Activity Id {1}, Client Connection Id {2}", ObjectID, ActivityCorrelator.Current, ClientConnectionId);
-
-                ConnectionState previousState = State;
-                Guid operationId = default(Guid);
-                Guid clientConnectionId = default(Guid);
-
-                // during the call to Dispose() there is a redundant call to
-                // Close(). because of this, the second time Close() is invoked the
-                // connection is already in a closed state. this doesn't seem to be a
-                // problem except for logging, as we'll get duplicate Before/After/Error
-                // log entries
-                if (previousState != ConnectionState.Closed)
-                {
-                    operationId = s_diagnosticListener.WriteConnectionCloseBefore(this);
-                    // we want to cache the ClientConnectionId for After/Error logging, as when the connection
-                    // is closed then we will lose this identifier
-                    //
-                    // note: caching this is only for diagnostics logging purposes
-                    clientConnectionId = ClientConnectionId;
-                }
-
-                SqlStatistics statistics = null;
-
-                Exception e = null;
-                try
-                {
-                    statistics = SqlStatistics.StartTimer(Statistics);
-
-                    Task reconnectTask = _currentReconnectionTask;
-                    if (reconnectTask != null && !reconnectTask.IsCompleted)
-                    {
-                        CancellationTokenSource cts = _reconnectionCancellationSource;
-                        if (cts != null)
-                        {
-                            cts.Cancel();
-                        }
-                        AsyncHelper.WaitForCompletion(reconnectTask, 0, null, rethrowExceptions: false); // we do not need to deal with possible exceptions in reconnection
-                        if (State != ConnectionState.Open)
-                        {// if we cancelled before the connection was opened
-                            OnStateChange(DbConnectionInternal.StateChangeClosed);
-                        }
-                    }
-                    CancelOpenAndWait();
-                    CloseInnerConnection();
-                    GC.SuppressFinalize(this);
-
-                    if (null != Statistics)
-                    {
-                        _statistics._closeTimestamp = ADP.TimerCurrent();
-                    }
-                }
-                catch (Exception ex)
-                {
-                    e = ex;
-                    throw;
-                }
-                finally
-                {
-                    SqlStatistics.StopTimer(statistics);
-
-                    // we only want to log this if the previous state of the
-                    // connection is open, as that's the valid use-case
-                    if (previousState != ConnectionState.Closed)
-                    {
-                        if (e != null)
-                        {
-                            s_diagnosticListener.WriteConnectionCloseError(operationId, clientConnectionId, this, e);
-                        }
-                        else
-                        {
-                            s_diagnosticListener.WriteConnectionCloseAfter(operationId, clientConnectionId, this);
-                        }
-                    }
-                }
-            }
+            _sqlConnectionX.Close();
         }
 
         /// <include file='../../../../../../../doc/snippets/Microsoft.Data.SqlClient/SqlConnection.xml' path='docs/members[@name="SqlConnection"]/CreateCommand/*' />
         new public SqlCommand CreateCommand()
         {
-            return new SqlCommand(null, this);
+            return _sqlConnectionX.CreateCommand();
         }
 
         private void DisposeMe(bool disposing)
@@ -1387,7 +1268,7 @@ namespace Microsoft.Data.SqlClient
         /// <include file='../../../../../../../doc/snippets/Microsoft.Data.SqlClient/SqlConnection.xml' path='docs/members[@name="SqlConnection"]/Open/*' />
         public override void Open()
         {
-            Open(SqlConnectionOverrides.None);
+            _sqlConnectionX.Open();
         }
 
         private bool TryOpenWithRetry(TaskCompletionSource<DbConnectionInternal> retry, SqlConnectionOverrides overrides)
@@ -1778,20 +1659,19 @@ namespace Microsoft.Data.SqlClient
         /// <include file='../../../../../../../doc/snippets/Microsoft.Data.SqlClient/SqlConnection.xml' path='docs/members[@name="SqlConnection"]/GetSchema2/*' />
         public override DataTable GetSchema()
         {
-            return GetSchema(DbMetaDataCollectionNames.MetaDataCollections, null);
+            return _sqlConnectionX.GetSchema();
         }
 
         /// <include file='../../../../../../../doc/snippets/Microsoft.Data.SqlClient/SqlConnection.xml' path='docs/members[@name="SqlConnection"]/GetSchemaCollectionName/*' />
         public override DataTable GetSchema(string collectionName)
         {
-            return GetSchema(collectionName, null);
+            return _sqlConnectionX.GetSchema(collectionName);
         }
 
         /// <include file='../../../../../../../doc/snippets/Microsoft.Data.SqlClient/SqlConnection.xml' path='docs/members[@name="SqlConnection"]/GetSchemaCollectionNameRestrictionValues/*' />
         public override DataTable GetSchema(string collectionName, string[] restrictionValues)
         {
-            SqlClientEventSource.Log.TryTraceEvent("SqlConnection.GetSchema | Info | Object Id {0}, Collection Name '{1}'", ObjectID, collectionName);
-            return InnerConnection.GetSchema(ConnectionFactory, PoolGroup, this, collectionName, restrictionValues);
+            return _sqlConnectionX.GetSchema(collectionName, restrictionValues);
         }
 
 #if NET6_0_OR_GREATER
